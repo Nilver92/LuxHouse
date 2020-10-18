@@ -1,0 +1,302 @@
+/*Proyecto ilumicacion casa ESP32
+ * Seguidor solar con RTC tiny desde ESp32 + Ina219
+ * Se envia post a base de datos en Heroku
+ * Inicio de troyecto 18/10/2020
+ * Pca
+ */
+ 
+#include <WiFi.h> //biblioteca para conexion wifi
+#include <WebServer.h>
+WiFiClient client;
+#include <Wire.h> //Conexiones I2C
+#include <SPI.h>
+#include "RTClib.h"
+RTC_DS1307 RTC;
+
+// SSID & Password
+const char* ssid = "Your network";  // Enter your SSID here
+const char* password = "Your password";  //Enter your Password here
+WebServer server(80);  // Object of WebServer(HTTP port, 80 is defult)
+
+//HOST o URL de su aplicación web sin http
+const char* host ="lucescasa.herokuapp.com";
+const int httpPort = 80; // puerto web por defecto: 80
+long tenvioHeroku = 0;       // Para guardar el tiempo de envio datos a heroku
+
+#include "Wire.h"
+#include "Adafruit_INA219.h"
+Adafruit_INA219 ina219;
+
+#include <driver/adc.h> //https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/api-reference/peripherals/adc.html
+int val = adc1_get_raw(ADC1_CHANNEL_0);  //variavle Chanel 0 Panel
+int val1 = adc1_get_raw(ADC1_CHANNEL_3); //variavle Chanel 3 Bateria
+int val2 = adc1_get_raw(ADC1_CHANNEL_4); //variavle Chanel 4 Corriente panel
+int val3 = adc1_get_raw(ADC1_CHANNEL_5); //variavle Chanel 5 temperatura 1
+int val4 = adc1_get_raw(ADC1_CHANNEL_6); //variavle Chanel 6 temperatura 2
+int val5 = adc1_get_raw(ADC1_CHANNEL_7); //variavle Chanel 7
+float Bat, Panel, Tem1, Tem2;      // variables tipo flotantes
+long tcargaBat = 0;       // Para guardar el tiempo de la última lectura
+#define ventilador 18    // Se establece GPIO18 como salida para Ventilador.
+#define CargaBat 13      // Pin salida control carga de bateria 
+
+byte giroccidente = 12; //al pin 12 se le asigna como giro salida para occidente. 
+byte giroriente = 14;   //al pin 14 se le asigna como giro salida para oriente.  
+byte oriente = 19;      // se establece GPIO19 como entrada fin de carrera para el oriente.
+byte occidente = 23;    // se establece GPIO23 como entrada fin de carrera para el occidente.
+boolean newoccidente = LOW;  //variable para guardar el estado del switch occidente.
+boolean neworiente = LOW;    //variable para guardar el estado del switch oriente.
+boolean retenocci = LOW;     //variable para la autoretencion del estado del switch occidente.
+boolean minutoactivo = LOW;  //variable para guardar el minuto activo.
+
+float shuntvoltage = 0; //Variable flotante voltaje de derivación
+float busvoltage = 0;   //Variable flotante
+float current_mA = 0;   //Variable flotante Corriente panel
+float loadvoltage = 0;  //Variable flotante
+float power_mW = 0;     //Variable flotante potencia en mW.
+
+void setup () {
+  Serial.begin(115200); // Establece la velocidad de datos del puerto serie
+  Serial.println("Try Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);   // Connect to your wi-fi modem
+ 
+  while (WiFi.status() != WL_CONNECTED) {   // Check wi-fi is connected to wi-fi network
+  delay(1000);
+  Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected successfully");
+  Serial.print("Got IP: ");
+  Serial.println(WiFi.localIP());  //Show ESP32 IP on serial
+
+  Wire.begin (21, 22); // Inicia el puerto I2C G21-sda y G22-scl
+  RTC.begin(); // Inicia la comunicación con el RTC
+  //RTC.adjust(DateTime(__DATE__, __TIME__)); // Establece la fecha y hora (Comentar una vez establecida la hora)
+ 
+    adc1_config_width(ADC_WIDTH_BIT_12); //Resolucion del ADC1 12 bit 4095 
+    adc1_config_channel_atten(ADC1_CHANNEL_0,ADC_ATTEN_DB_11); //configuracion canal 0 11 decibelios 3.3 volt
+    adc1_config_channel_atten(ADC1_CHANNEL_3,ADC_ATTEN_DB_11); //- 0dB attenuaton (ADC_ATTEN_DB_0) gives full-scale voltage 1.1V
+    adc1_config_channel_atten(ADC1_CHANNEL_4,ADC_ATTEN_DB_11); //- 0dB attenuaton (ADC_ATTEN_DB_0) gives full-scale voltage 1.1V
+    adc1_config_channel_atten(ADC1_CHANNEL_5,ADC_ATTEN_DB_11); // - 2.5dB attenuation (ADC_ATTEN_DB_2_5) gives full-scale voltage 1.5V
+    adc1_config_channel_atten(ADC1_CHANNEL_6,ADC_ATTEN_DB_11); //- 6dB attenuation (ADC_ATTEN_DB_6) gives full-scale voltage 2.2V
+    adc1_config_channel_atten(ADC1_CHANNEL_7,ADC_ATTEN_DB_11); // - 11dB attenuation (ADC_ATTEN_DB_11) gives full-scale voltage 3.9V (see note below)
+
+  while (!Serial) {
+    ; // wait for serial port to connect. Needed for native USB port only
+  }
+
+  if (! ina219.begin()) {
+    Serial.println("Failed to find INA219 chip");
+    while (1) { delay(10); }
+  }
+
+  pinMode(CargaBat, OUTPUT); // Pin GPIo13 como salida
+
+  pinMode(giroccidente, OUTPUT); //establece el D2 como salida.
+  pinMode(giroriente, OUTPUT);   //establece el D1 como salida.
+  pinMode(oriente, INPUT);       //habilita entrada para oriente.
+  pinMode(occidente, INPUT);     //habilita entrada para occidente.
+  pinMode(oriente, INPUT_PULLDOWN);  //habilita entrada con pulldown por soft.
+  pinMode(occidente, INPUT_PULLDOWN);  //habilita entrada con pulldown por soft.
+  pinMode(ventilador, OUTPUT);     //establece el GPIO18 como salida.
+}
+
+void loop(){
+
+//***********************Toma de lecturas analogicas***************************  
+   Panel = (map(analogRead(36),0,4095,0,2375))/100.00;  // Obtenga datos de sensores analógicos Chanel0
+   Bat =  (map(analogRead(39),0,4095,0,1980))/100.00;   //  Obtenga datos de sensores analógicos Chanel3
+   Tem1 = (map(analogRead(33),0,4095,0,8500))/100.00;    // Obtenga datos de sensores analógicos Chanel5
+   Tem2 = (map(analogRead(34),0,4095,0,8500))/100.00;    //Obtenga datos de sensores analógicos Chanel6
+   /*Serial.print("Lectura Panel:");Serial.print(' ');Serial.print(Panel);Serial.print(' ');      
+   Serial.print("Bateria:");Serial.print(' ');Serial.print(Bat);Serial.print(' ');          
+   Serial.print("Temperatura1:");Serial.print(' ');Serial.print(Tem1);Serial.print(' ');
+   Serial.print("Temperatura2:");Serial.print(' ');Serial.print(Tem2); 
+   Serial.println();*/
+//***********************Activacion de Tiny RTC**************************************  
+  DateTime now = RTC.now(); // Obtiene la fecha y hora del RTC
+  /*Serial.print(now.year(), DEC); Serial.print('/'); Serial.print(now.month(), DEC); Serial.print('/'); Serial.print(now.day(), DEC); // año/mes/Dia
+  Serial.print(' ');
+  Serial.print(now.hour(), DEC); Serial.print(':'); Serial.print(now.minute(), DEC); Serial.print(':'); Serial.print(now.second(), DEC); // Segundos
+  Serial.println();*/
+  //delay(500); // La información se actualiza cada 1 seg.
+
+//*************Lectura modulo INA219*************************
+  shuntvoltage = ina219.getShuntVoltage_mV();  // voltaje de derivación
+  busvoltage = ina219.getBusVoltage_V();       //obtener voltaje de bus
+  current_mA = ina219.getCurrent_mA();         //obtener corriente
+  power_mW = ina219.getPower_mW();             //Obtener potencia
+  loadvoltage = busvoltage + (shuntvoltage / 1000);
+
+  /*Serial.print("INAVoltBat:"); Serial.print(busvoltage); Serial.print("\t");    //Mostrar obtener voltaje de bus
+  Serial.print("INAVoltDif:");Serial.print(shuntvoltage); Serial.print("\t");  //voltaje de derivación
+  Serial.print("INAVoltPanel:");Serial.print(loadvoltage); Serial.print("\t");   //Carga de voltaje
+  Serial.print("Corriente:");Serial.print(current_mA); Serial.print("\t");    //mostrar Corriente
+  Serial.print("Potencia mW:");Serial.println(power_mW);                        //mostrar potencia
+  Serial.println();
+*/
+//***********************Carga de bateria************************
+ if(now.hour() >= 6 and now.hour() <= 17){    //cuando este en el intervalo se carga bateria.
+  if(millis() - tcargaBat > 3000){ //cada 3000 mili segundos.
+    if ((Bat < 16.9) and (Tem1 < 35.0) and (Tem2 < 35.0)){digitalWrite(CargaBat, HIGH);} //hace el control de la carga de la bateria
+      else{digitalWrite(CargaBat, LOW);}
+      tcargaBat = millis(); //actualizamos el tiempo de la última lectura
+  }
+ }
+  else{digitalWrite(CargaBat, LOW);} //desactiva carga de bateria
+
+//--------------Ventilador-------------------------------
+ if ((Tem1 >= 33.0) or (Tem2 >= 33.0)){digitalWrite(ventilador, HIGH);} //ventilador en caso de sobretemperatura mayor que 32 
+   else{digitalWrite(ventilador, LOW);}
+   
+//-------------------------Seguidor solar---------------------------
+  newoccidente = digitalRead(occidente); //lee el estado del switch occidente
+  neworiente = digitalRead(oriente);  //lee el estado de switch oriente
+  if (newoccidente == HIGH){retenocci = HIGH ;} //inicia rtencion occi
+
+if ( newoccidente == LOW){  //mientras que el switch occidente no sea accionado ejecuta.
+  switch (now.hour()) //switch pra activar el giro occidente durante 5 segundos por cada hora.
+   {
+   case 9:
+      if (now.minute() == 1 ){  //mientras sean las 9 a.m y las 4 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+  break;   
+
+   case 10:
+      if (now.minute() == 1 ){  //mientras sean las 10 a.m y las 4 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+  break;
+
+  case 11:
+      if (now.minute() == 1 ){  //mientras sean las 11 a.m y las 4 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };
+    
+    if (now.minute() == 30 ){  //mientras sean las 11 a.m y las 14 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+           else {  digitalWrite(giroccidente, LOW); }
+      };
+    break;
+
+   case 12:
+      if (now.minute() == 1  ){  //mientras sean las 12 a.m y las 4 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };
+
+      if (now.minute() == 30 ){  //mientras sean las 12 a.m y las 14 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+           else {  digitalWrite(giroccidente, LOW); }
+      };    
+  break;
+
+   case 13:
+      if (now.minute() == 1 ){  //mientras sean las 13 a.m y las 14 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };    
+
+      if (now.minute() == 30 ){  //mientras sean las 13 a.m y las 14 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+   break;
+   
+   case 14:
+      if (now.minute() == 1 ){  //mientras sean las 14 y las 15 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+
+      if (now.minute() == 30 ){  //mientras sean las 14 y las 15 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+  break;
+ 
+   case 15:
+      if (now.minute() == 1 ){  //mientras sean las 15 a.m y las 4 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+   break;
+
+   case 16:
+      if (now.minute() == 1 ){  //mientras sean las 16 a.m y las 4 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+  break;
+
+   case 17:
+      if (now.minute() == 1 ){  //mientras sean las 17 a.m y las 4 p.m 
+        if ((now.second() >= 1) and (now.second() <= 11)) {  digitalWrite(giroccidente, HIGH); } //activa la salida occidente 10 seg cada hora.
+      else {  digitalWrite(giroccidente, LOW); }
+      };  
+  break;
+  
+  default:
+    digitalWrite(giroccidente, LOW);//si nada coincide, hace lo predeterminado
+    // default es optional
+  break;
+ }
+
+}
+else {  digitalWrite(giroccidente, LOW); }
+
+
+  if ((now.hour() >= 18) and ( retenocci == HIGH) and (neworiente == LOW)){digitalWrite(giroriente, HIGH);} //activa el giro oriente siempre y cuando sean las 6 p.m 
+   else {digitalWrite(giroriente, LOW);}
+  if (neworiente == HIGH){retenocci = LOW ; } // el switch oriente reinicia la autoretencion de "retenocci".
+
+
+//**********Envio de datos a Heroku******
+
+  if(millis() - tenvioHeroku > 120000){ //cada 3000 mili segundos.
+  
+  if(!client.connect(host,httpPort)){
+    Serial.println("Conexion fallida");  
+  }
+  else{
+    Serial.print("Conectado a la aplicación :");
+    Serial.println(host);
+    String tabla = "lecturas";
+    float Ipanel = current_mA;
+    float Voltbat = Bat;
+    float Voltpanel = Panel;
+    float Temp1 = Tem1;
+    float Temp2 = Tem2;
+    float mWatt = power_mW;
+    sendPost(tabla, Voltbat, Voltpanel, Ipanel, Temp1, Temp2, mWatt);
+  }
+  
+  if (client.available()) {
+    char c = client.read();
+    Serial.print(c);
+  }
+  
+      tenvioHeroku = millis(); //actualizamos el tiempo de la última lectura
+  }  
+
+}
+
+void sendPost(String tabla, float Voltbat, float Voltpanel, float Ipanel, float Temp1, float Temp2, float mWatt){
+  //Creamos la direccion para luego usarla
+  String dato = "tabla=" + String(tabla) + "&Voltbat=" + String(Voltbat) + "&Voltpanel=" + String(Voltpanel) + "&Ipanel=" + String(Ipanel) + "&Temp1=" + String(Temp1) + "&Temp2=" + String(Temp2) + "&mWatt=" + String(mWatt);
+ 
+  // Solicitud de tipo post para enviar al servidor 
+  client.println("POST /guardarlectura HTTP/1.1");
+  client.println("Host: lucescasa.herokuapp.com");
+  client.println("Cache-Control: no-cache");
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(dato.length());
+  client.println();
+  client.println(dato);
+  Serial.println("Respuesta: ");
+}
